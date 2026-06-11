@@ -65,3 +65,67 @@ pub fn chunk_with_grammar(relative: &str, language: &str, content: &str) -> Opti
         Some(chunks)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grammar_for_covers_the_supported_stack() {
+        for lang in [
+            "rust",
+            "go",
+            "python",
+            "javascript",
+            "typescript",
+            "php",
+            "java",
+            "c",
+            "cpp",
+            "ruby",
+            "css",
+            "html",
+            "elixir",
+            "erlang",
+        ] {
+            assert!(grammar_for(lang).is_some(), "missing grammar for {lang}");
+        }
+    }
+
+    #[test]
+    fn grammar_for_returns_none_for_unwired_language() {
+        assert!(grammar_for("yaml").is_none());
+        assert!(grammar_for("vue").is_none());
+        assert!(grammar_for("toml").is_none());
+    }
+
+    #[test]
+    fn unwired_language_falls_through() {
+        assert!(chunk_with_grammar("a.yaml", "yaml", "k: v\n").is_none());
+    }
+
+    #[test]
+    fn rust_splits_into_construct_level_chunks() {
+        let src =
+            "use std::fmt;\n\nfn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    let y = 2;\n}\n";
+        let chunks = chunk_with_grammar("lib.rs", "rust", src).expect("rust chunks");
+        // one chunk per top-level construct: use, fn alpha, fn beta
+        assert_eq!(chunks.len(), 3);
+        // line numbers are 1-based and track the source
+        assert_eq!(chunks[0].line_start, 1); // `use`
+        assert_eq!(chunks[1].line_start, 3); // fn alpha
+        assert_eq!((chunks[2].line_start, chunks[2].line_end), (7, 9)); // fn beta
+        assert!(chunks[1].text.contains("fn alpha"));
+        assert!(chunks.iter().all(|c| c.language == "rust"));
+        assert!(chunks.iter().all(|c| c.hash.len() == 16));
+    }
+
+    #[test]
+    fn go_top_level_decls_are_separate_chunks() {
+        let src = "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n";
+        let chunks = chunk_with_grammar("main.go", "go", src).expect("go chunks");
+        // package clause, import decl, func decl
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().any(|c| c.text.contains("func main")));
+    }
+}

@@ -30,9 +30,11 @@ fn schema(dim: i32) -> SchemaRef {
 }
 
 pub async fn open_db(out: &Path) -> Result<Connection> {
-    Ok(lancedb::connect(out.to_str().context("non-utf8 index path")?)
-        .execute()
-        .await?)
+    Ok(
+        lancedb::connect(out.to_str().context("non-utf8 index path")?)
+            .execute()
+            .await?,
+    )
 }
 
 pub async fn table_exists(db: &Connection) -> Result<bool> {
@@ -153,4 +155,63 @@ fn col_f32<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a Float32Array> {
     b.column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
         .with_context(|| format!("column {name} (f32) missing"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(relative: &str, line: u32) -> Chunk {
+        Chunk {
+            relative: relative.to_string(),
+            language: "rust".into(),
+            line_start: line,
+            line_end: line + 1,
+            text: format!("// {relative}\nfn f() {{}}"),
+            hash: "deadbeef".into(),
+        }
+    }
+
+    // End-to-end against a real LanceDB on disk (no network / no Ollama):
+    // create table -> add -> nearest-neighbour search -> delete by file.
+    #[tokio::test]
+    async fn store_roundtrip_add_search_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path()).await.unwrap();
+        assert!(!table_exists(&db).await.unwrap());
+
+        let dim = 3;
+        let table = ensure_table(&db, dim).await.unwrap();
+        assert!(table_exists(&db).await.unwrap());
+
+        let records = vec![
+            (chunk("a.rs", 1), vec![1.0, 0.0, 0.0]),
+            (chunk("b.rs", 1), vec![0.0, 1.0, 0.0]),
+            (chunk("c.rs", 1), vec![0.0, 0.0, 1.0]),
+        ];
+        add_chunks(&table, dim, &records).await.unwrap();
+
+        // query nearest to a.rs's vector -> a.rs ranks first.
+        let hits = search(dir.path(), vec![0.9, 0.1, 0.0], 3).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].relative, "a.rs");
+        assert_eq!(hits[0].line_start, 1);
+        assert_eq!(hits[0].line_end, 2);
+
+        // delete drops only the named file's chunks.
+        delete_files(&table, &["a.rs".into()]).await.unwrap();
+        let after = search(dir.path(), vec![0.9, 0.1, 0.0], 3).await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(!after.iter().any(|h| h.relative == "a.rs"));
+    }
+
+    #[tokio::test]
+    async fn ensure_table_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path()).await.unwrap();
+        ensure_table(&db, 4).await.unwrap();
+        // second call opens the existing table rather than recreating it.
+        ensure_table(&db, 4).await.unwrap();
+        assert!(table_exists(&db).await.unwrap());
+    }
 }

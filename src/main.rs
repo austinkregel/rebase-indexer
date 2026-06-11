@@ -54,12 +54,21 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Index { dir, ollama, model, out, lang, max_bytes } => {
-            index(dir, ollama, model, out, lang, max_bytes).await
-        }
-        Cmd::Search { index, query, ollama, model, k } => {
-            search(index, query, ollama, model, k).await
-        }
+        Cmd::Index {
+            dir,
+            ollama,
+            model,
+            out,
+            lang,
+            max_bytes,
+        } => index(dir, ollama, model, out, lang, max_bytes).await,
+        Cmd::Search {
+            index,
+            query,
+            ollama,
+            model,
+            k,
+        } => search(index, query, ollama, model, k).await,
     }
 }
 
@@ -84,7 +93,11 @@ async fn index(
     for f in walk::walk(&dir, &lang, max_bytes) {
         if let Ok(content) = std::fs::read_to_string(&f.path) {
             let hash = manifest::file_hash(&content);
-            current.push(Cur { entry: f, content, hash });
+            current.push(Cur {
+                entry: f,
+                content,
+                hash,
+            });
         }
     }
 
@@ -95,7 +108,11 @@ async fn index(
     // Diff against the manifest.
     let changed: Vec<&Cur> = current
         .iter()
-        .filter(|c| prev.get(&c.entry.relative).map(|h| h != &c.hash).unwrap_or(true))
+        .filter(|c| {
+            prev.get(&c.entry.relative)
+                .map(|h| h != &c.hash)
+                .unwrap_or(true)
+        })
         .collect();
     let removed: Vec<String> = prev
         .keys()
@@ -120,12 +137,21 @@ async fn index(
     // Chunk + embed only the changed files.
     let mut chunks = Vec::new();
     for c in &changed {
-        chunks.extend(chunk::chunk_file(&c.entry.relative, &c.entry.language, &c.content));
+        chunks.extend(chunk::chunk_file(
+            &c.entry.relative,
+            &c.entry.language,
+            &c.content,
+        ));
     }
     let vectors = if chunks.is_empty() {
         Vec::new()
     } else {
-        eprintln!("embedding {} chunks via {} ({})", chunks.len(), ollama, model);
+        eprintln!(
+            "embedding {} chunks via {} ({})",
+            chunks.len(),
+            ollama,
+            model
+        );
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         embed::Embedder::new(&ollama, &model).embed(&texts).await?
     };

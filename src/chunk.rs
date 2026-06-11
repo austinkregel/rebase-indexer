@@ -52,3 +52,55 @@ fn chunk_lines(relative: &str, language: &str, content: &str) -> Vec<Chunk> {
     }
     chunks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_content_yields_no_chunks() {
+        assert!(chunk_lines("a.yaml", "yaml", "").is_empty());
+    }
+
+    #[test]
+    fn short_file_is_one_chunk_with_path_prefix() {
+        let chunks = chunk_lines("conf/app.yaml", "yaml", "a: 1\nb: 2\n");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].line_start, 1);
+        assert_eq!(chunks[0].line_end, 2);
+        assert!(chunks[0].text.starts_with("// conf/app.yaml (yaml)\n"));
+        assert!(chunks[0].text.contains("a: 1"));
+    }
+
+    #[test]
+    fn long_file_windows_with_overlap() {
+        let body: String = (1..=140).map(|n| format!("line{n}\n")).collect();
+        let chunks = chunk_lines("big.yaml", "yaml", &body);
+        // step = WINDOW - OVERLAP = 50; windows start at lines 1, 51, 101.
+        assert_eq!(chunks.len(), 3);
+        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 60));
+        assert_eq!((chunks[1].line_start, chunks[1].line_end), (51, 110));
+        assert_eq!((chunks[2].line_start, chunks[2].line_end), (101, 140));
+        // consecutive windows overlap by OVERLAP lines
+        assert_eq!(
+            chunks[0].line_end - chunks[1].line_start + 1,
+            OVERLAP as u32
+        );
+    }
+
+    #[test]
+    fn chunk_file_falls_back_to_lines_for_unwired_language() {
+        // yaml has no tree-sitter grammar wired -> line windows.
+        let chunks = chunk_file("a.yaml", "yaml", "x: 1\n");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].language, "yaml");
+    }
+
+    #[test]
+    fn chunk_hash_is_stable_for_same_text() {
+        let a = chunk_lines("a.yaml", "yaml", "k: v\n");
+        let b = chunk_lines("a.yaml", "yaml", "k: v\n");
+        assert_eq!(a[0].hash, b[0].hash);
+        assert_eq!(a[0].hash.len(), 16); // sha256[..8] -> 16 hex chars
+    }
+}

@@ -69,7 +69,9 @@ pub fn walk(root: &Path, langs: &[String], max_bytes: u64) -> Vec<FileEntry> {
             continue;
         }
         let path = entry.path().to_path_buf();
-        let Ok(head) = std::fs::read(&path) else { continue };
+        let Ok(head) = std::fs::read(&path) else {
+            continue;
+        };
         if looks_binary(&head) {
             continue;
         }
@@ -85,4 +87,82 @@ pub fn walk(root: &Path, langs: &[String], max_bytes: u64) -> Vec<FileEntry> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::fs;
+
+    #[test]
+    fn language_for_maps_known_extensions() {
+        assert_eq!(language_for("main.rs"), Some("rust"));
+        assert_eq!(language_for("App.tsx"), Some("typescript"));
+        assert_eq!(language_for("index.JSX"), Some("javascript")); // case-insensitive
+        assert_eq!(language_for("page.vue"), Some("vue"));
+        assert_eq!(language_for("mix.exs"), Some("elixir"));
+        assert_eq!(language_for("node.erl"), Some("erlang"));
+        assert_eq!(language_for("style.scss"), Some("css"));
+    }
+
+    #[test]
+    fn language_for_rejects_unknown_and_extensionless() {
+        assert_eq!(language_for("a.out"), None);
+        assert_eq!(language_for("Makefile"), None);
+        assert_eq!(language_for("LICENSE"), None);
+    }
+
+    #[test]
+    fn looks_binary_detects_null_byte() {
+        assert!(looks_binary(b"\x7fELF\x00\x00"));
+        assert!(!looks_binary(b"fn main() {}\n"));
+        // null beyond the 256-byte sniff window is not inspected
+        let mut late = vec![b'a'; 300];
+        late[280] = 0;
+        assert!(!looks_binary(&late));
+    }
+
+    #[test]
+    fn walk_filters_git_binaries_empty_and_by_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("keep.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("notes.md"), "# hi\n").unwrap();
+        fs::write(root.join("empty.rs"), "").unwrap();
+        fs::write(root.join("bin.rs"), b"abc\x00def").unwrap();
+        fs::write(root.join("ignore.unknown"), "x").unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".git").join("config.rs"), "fn x() {}").unwrap();
+        let nested = root.join("node_modules").join("dep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("lib.rs"), "pub fn d() {}\n").unwrap();
+
+        let all: HashSet<String> = walk(root, &[], 524_288)
+            .into_iter()
+            .map(|f| f.relative)
+            .collect();
+        assert!(all.contains("keep.rs"));
+        assert!(all.contains("notes.md"));
+        assert!(all.contains("node_modules/dep/lib.rs")); // descends into deps
+        assert!(!all.contains("empty.rs")); // zero-length skipped
+        assert!(!all.contains("bin.rs")); // binary skipped
+        assert!(!all.contains("ignore.unknown")); // unknown ext skipped
+        assert!(!all.iter().any(|r| r.contains(".git"))); // .git pruned
+
+        let rust_only: HashSet<String> = walk(root, &["rust".into()], 524_288)
+            .into_iter()
+            .map(|f| f.relative)
+            .collect();
+        assert!(rust_only.contains("keep.rs"));
+        assert!(!rust_only.contains("notes.md")); // language filter applied
+    }
+
+    #[test]
+    fn walk_skips_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("big.rs"), "x".repeat(1000)).unwrap();
+        let found = walk(dir.path(), &[], 500);
+        assert!(found.is_empty());
+    }
 }
