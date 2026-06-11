@@ -1,11 +1,14 @@
 mod chunk;
 mod embed;
+mod manifest;
 mod store;
+mod tschunk;
 mod walk;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 /// Builds a per-project LanceDB code index for rebase, embedding via Ollama.
@@ -60,6 +63,12 @@ async fn main() -> Result<()> {
     }
 }
 
+struct Cur {
+    entry: walk::FileEntry,
+    content: String,
+    hash: String,
+}
+
 async fn index(
     dir: PathBuf,
     ollama: String,
@@ -69,26 +78,77 @@ async fn index(
     max_bytes: u64,
 ) -> Result<()> {
     let out = out.unwrap_or_else(|| dir.join(".rebase-index"));
-    let files = walk::walk(&dir, &lang, max_bytes);
-    eprintln!("scanning {} files under {}", files.len(), dir.display());
 
-    let mut chunks = Vec::new();
-    for f in &files {
-        let Ok(content) = std::fs::read_to_string(&f.path) else { continue };
-        chunks.extend(chunk::chunk_file(&f.relative, &f.language, &content));
+    // Read + hash every current file.
+    let mut current: Vec<Cur> = Vec::new();
+    for f in walk::walk(&dir, &lang, max_bytes) {
+        if let Ok(content) = std::fs::read_to_string(&f.path) {
+            let hash = manifest::file_hash(&content);
+            current.push(Cur { entry: f, content, hash });
+        }
     }
-    anyhow::ensure!(!chunks.is_empty(), "no indexable files found under {}", dir.display());
-    eprintln!("embedding {} chunks via {} ({})", chunks.len(), ollama, model);
 
-    let embedder = embed::Embedder::new(&ollama, &model);
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let vectors = embedder.embed(&texts).await?;
+    let manifest_path = out.join("manifest.json");
+    let prev = manifest::load(&manifest_path);
+    let current_rel: HashSet<&str> = current.iter().map(|c| c.entry.relative.as_str()).collect();
+
+    // Diff against the manifest.
+    let changed: Vec<&Cur> = current
+        .iter()
+        .filter(|c| prev.get(&c.entry.relative).map(|h| h != &c.hash).unwrap_or(true))
+        .collect();
+    let removed: Vec<String> = prev
+        .keys()
+        .filter(|k| !current_rel.contains(k.as_str()))
+        .cloned()
+        .collect();
+
+    let db = store::open_db(&out).await?;
+    let has_table = store::table_exists(&db).await?;
+
+    if changed.is_empty() && removed.is_empty() && has_table {
+        eprintln!("index up to date — {} files", current.len());
+        return Ok(());
+    }
+    eprintln!(
+        "{} changed, {} removed, {} files total",
+        changed.len(),
+        removed.len(),
+        current.len()
+    );
+
+    // Chunk + embed only the changed files.
+    let mut chunks = Vec::new();
+    for c in &changed {
+        chunks.extend(chunk::chunk_file(&c.entry.relative, &c.entry.language, &c.content));
+    }
+    let vectors = if chunks.is_empty() {
+        Vec::new()
+    } else {
+        eprintln!("embedding {} chunks via {} ({})", chunks.len(), ollama, model);
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+        embed::Embedder::new(&ollama, &model).embed(&texts).await?
+    };
     anyhow::ensure!(vectors.len() == chunks.len(), "embedding count mismatch");
-    let dim = vectors.first().map(|v| v.len() as i32).context("empty embedding")?;
+    let dim = vectors.first().map(|v| v.len() as i32);
 
-    let records: Vec<(chunk::Chunk, Vec<f32>)> = chunks.into_iter().zip(vectors).collect();
-    store::build(&out, dim, &records).await?;
-    eprintln!("wrote {}-dim index to {}", dim, out.display());
+    if has_table || dim.is_some() {
+        let table = store::ensure_table(&db, dim.unwrap_or(1)).await?;
+        // Replace changed files + drop removed ones, then add fresh chunks.
+        let mut to_delete: Vec<String> = changed.iter().map(|c| c.entry.relative.clone()).collect();
+        to_delete.extend(removed);
+        store::delete_files(&table, &to_delete).await?;
+        let records: Vec<(chunk::Chunk, Vec<f32>)> = chunks.into_iter().zip(vectors).collect();
+        store::add_chunks(&table, dim.unwrap_or(1), &records).await?;
+    }
+
+    // Persist the new manifest.
+    let new_manifest: manifest::Manifest = current
+        .iter()
+        .map(|c| (c.entry.relative.clone(), c.hash.clone()))
+        .collect();
+    manifest::save(&manifest_path, &new_manifest)?;
+    eprintln!("index updated at {}", out.display());
     Ok(())
 }
 

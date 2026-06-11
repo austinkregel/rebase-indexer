@@ -12,10 +12,17 @@ pub struct Chunk {
 const WINDOW: usize = 60;
 const OVERLAP: usize = 10;
 
-/// Line-window chunking with a small overlap (language-agnostic v1; tree-sitter
-/// AST chunking is a later upgrade). Each chunk is prefixed with its file path
-/// so the embedding has a little locating context.
+/// Chunk a file: boundary-aware via tree-sitter when a grammar is wired for the
+/// language, else line windows. Each chunk is prefixed with its file path so
+/// the embedding has a little locating context.
 pub fn chunk_file(relative: &str, language: &str, content: &str) -> Vec<Chunk> {
+    if let Some(chunks) = crate::tschunk::chunk_with_grammar(relative, language, content) {
+        return chunks;
+    }
+    chunk_lines(relative, language, content)
+}
+
+fn chunk_lines(relative: &str, language: &str, content: &str) -> Vec<Chunk> {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return Vec::new();

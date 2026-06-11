@@ -7,6 +7,7 @@ use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, RecordBatchItera
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::{Connection, Table};
 
 use crate::chunk::Chunk;
 
@@ -28,10 +29,39 @@ fn schema(dim: i32) -> SchemaRef {
     ]))
 }
 
-/// Build (or replace) the per-project index at `out` from embedded chunks.
-pub async fn build(out: &Path, dim: i32, records: &[(Chunk, Vec<f32>)]) -> Result<()> {
-    let schema = schema(dim);
+pub async fn open_db(out: &Path) -> Result<Connection> {
+    Ok(lancedb::connect(out.to_str().context("non-utf8 index path")?)
+        .execute()
+        .await?)
+}
 
+pub async fn table_exists(db: &Connection) -> Result<bool> {
+    Ok(db.table_names().execute().await?.iter().any(|t| t == TABLE))
+}
+
+/// Open the chunks table, creating it (with the given vector dim) if absent.
+pub async fn ensure_table(db: &Connection, dim: i32) -> Result<Table> {
+    if table_exists(db).await? {
+        Ok(db.open_table(TABLE).execute().await?)
+    } else {
+        Ok(db.create_empty_table(TABLE, schema(dim)).execute().await?)
+    }
+}
+
+/// Remove all chunks belonging to the given files (used before re-adding a
+/// changed file, and to drop removed files).
+pub async fn delete_files(table: &Table, relatives: &[String]) -> Result<()> {
+    for r in relatives {
+        let esc = r.replace('\'', "''");
+        table.delete(&format!("relative = '{esc}'")).await?;
+    }
+    Ok(())
+}
+
+pub async fn add_chunks(table: &Table, dim: i32, records: &[(Chunk, Vec<f32>)]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
     let mut vb = FixedSizeListBuilder::new(Float32Builder::new(), dim);
     let mut rel = StringBuilder::new();
     let mut lang = StringBuilder::new();
@@ -50,7 +80,7 @@ pub async fn build(out: &Path, dim: i32, records: &[(Chunk, Vec<f32>)]) -> Resul
         txt.append_value(&c.text);
     }
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        schema(dim),
         vec![
             Arc::new(vb.finish()),
             Arc::new(rel.finish()),
@@ -61,15 +91,8 @@ pub async fn build(out: &Path, dim: i32, records: &[(Chunk, Vec<f32>)]) -> Resul
             Arc::new(txt.finish()),
         ],
     )?;
-
-    let db = lancedb::connect(out.to_str().context("non-utf8 index path")?)
-        .execute()
-        .await?;
-    if db.table_names().execute().await?.iter().any(|t| t == TABLE) {
-        db.drop_table(TABLE).await?;
-    }
-    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-    db.create_table(TABLE, Box::new(batches)).execute().await?;
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema(dim));
+    table.add(Box::new(batches)).execute().await?;
     Ok(())
 }
 
@@ -82,11 +105,8 @@ pub struct Hit {
     pub text: String,
 }
 
-/// k-NN search against the index. Query must be embedded with the same model.
 pub async fn search(index: &Path, query: Vec<f32>, k: usize) -> Result<Vec<Hit>> {
-    let db = lancedb::connect(index.to_str().context("non-utf8 index path")?)
-        .execute()
-        .await?;
+    let db = open_db(index).await?;
     let tbl = db.open_table(TABLE).execute().await?;
     let batches: Vec<RecordBatch> = tbl
         .query()
