@@ -181,7 +181,24 @@ async fn index(
         embed::Embedder::new(&ollama, &model).embed(&texts).await?
     };
     anyhow::ensure!(vectors.len() == chunks.len(), "embedding count mismatch");
-    let dim = vectors.first().map(|v| v.len() as i32);
+
+    // Pair chunks with their embeddings, dropping any that couldn't be embedded
+    // (the embedder retries individually and yields None for the few that fail,
+    // so a handful of bad chunks never aborts the whole index).
+    let chunk_count = chunks.len();
+    let records: Vec<(chunk::Chunk, Vec<f32>)> = chunks
+        .into_iter()
+        .zip(vectors)
+        .filter_map(|(c, v)| v.map(|vec| (c, vec)))
+        .collect();
+    if records.len() < chunk_count {
+        eprintln!(
+            "embedded {} chunks; skipped {} that failed to embed",
+            records.len(),
+            chunk_count - records.len()
+        );
+    }
+    let dim = records.first().map(|(_, v)| v.len() as i32);
 
     if has_table || dim.is_some() {
         let table = store::ensure_table(&db, dim.unwrap_or(1)).await?;
@@ -189,7 +206,6 @@ async fn index(
         let mut to_delete: Vec<String> = changed.iter().map(|c| c.entry.relative.clone()).collect();
         to_delete.extend(removed);
         store::delete_files(&table, &to_delete).await?;
-        let records: Vec<(chunk::Chunk, Vec<f32>)> = chunks.into_iter().zip(vectors).collect();
         store::add_chunks(&table, dim.unwrap_or(1), &records).await?;
     }
 
