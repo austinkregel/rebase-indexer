@@ -49,6 +49,13 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         k: usize,
     },
+    /// Pack a built index directory into one gzip-tar archive for download.
+    Pack {
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -69,7 +76,25 @@ async fn main() -> Result<()> {
             model,
             k,
         } => search(index, query, ollama, model, k).await,
+        Cmd::Pack { index, out } => pack(index, out),
     }
+}
+
+/// Bundle a built `.rebase-index` directory into a single gzip-tar archive so the
+/// app can download it in one `file_get` instead of many. Entries are stored
+/// relative to the index dir, so extraction unpacks straight into the target.
+fn pack(index: PathBuf, out: PathBuf) -> Result<()> {
+    anyhow::ensure!(index.exists(), "index dir not found: {}", index.display());
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::File::create(&out)?;
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    tar.append_dir_all(".", &index)?;
+    tar.into_inner()?.finish()?;
+    eprintln!("packed {} -> {}", index.display(), out.display());
+    Ok(())
 }
 
 struct Cur {
